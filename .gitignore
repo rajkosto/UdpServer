@@ -1,0 +1,11 @@
+.vs/
+ipch/
+/Debug/
+/Release/
+/x64/
+*.suo
+*.sdf
+*.opensdf
+*.aps
+*.user
+Thumbs.db
