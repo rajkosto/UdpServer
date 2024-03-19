@@ -1,13 +1,17 @@
-#include <ctime>
 #include <iostream>
 #include <string>
 #include <map>
 #include <memory>
+#include <chrono>
+#include <cassert>
+#include <sstream>
 #include <boost/bind/bind.hpp>
 #include <boost/asio.hpp>
 
 using u8 = std::uint8_t;
 using u16 = std::uint16_t;
+using u32 = std::uint32_t;
+using u64 = std::uint64_t;
 using usize = std::size_t;
 using ushort = unsigned short;
 using std::string;
@@ -22,11 +26,41 @@ using SystemError = boost::system::system_error;
 using TcpEndpoint = tcp::endpoint;
 using UdpEndpoint = udp::endpoint;
 
+static u64 MonotonicMicrosecondNow()
+{
+	//Get the current time point from the steady clock
+	const auto now = std::chrono::steady_clock::now();
+
+	//Convert the time point to microseconds since the epoch of the steady clock
+	auto now_us = std::chrono::time_point_cast<std::chrono::microseconds>(now).time_since_epoch();
+
+	//return the current time in microseconds
+	return static_cast<u64>(now_us.count());
+}
+
+struct DistributedPacket
+{
+	using SharedPtr = std::shared_ptr<DistributedPacket>;
+	DistributedPacket(string src, const void* srcBytes, usize srcLen) : creationTime(MonotonicMicrosecondNow()), recvSource(std::move(src))
+	{
+		if (srcLen > 0)
+		{
+			contents.resize(srcLen);
+			memcpy(contents.data(),srcBytes,contents.size());
+		}
+	}
+
+	u64 creationTime;
+	string recvSource;
+	ByteVector contents;
+	SharedPtr nextPacket;
+};
+
 class Subscriber
 {
 public:
 	virtual ~Subscriber() {}
-	virtual void sendResponse(const void* dataBuf, usize dataLen) = 0;
+	virtual void sendResponse(DistributedPacket::SharedPtr thePacket) = 0;
 };
 
 class Publisher
@@ -49,48 +83,82 @@ class ListenerBase : public Publisher
 public:
 	virtual bool stop() = 0;
 	virtual void initiateReceive() = 0;
-	usize addClient(const std::shared_ptr<Subscriber>& newClient) override
+
+	using SharedSubPtr = std::shared_ptr<Subscriber>;
+	using WeakSubPtr = std::weak_ptr<Subscriber>;
+
+protected:
+	auto activeClients() { return clientsPtr; }
+	usize numClients() const { return clientsPtr->size(); }
+	auto clientsBegin() { return activeClients()->begin(); }
+	auto clientsEnd() { return activeClients()->end(); }
+
+public:
+	usize addClient(const SharedSubPtr& newClient) override
 	{
-		const usize oldNumClients = clients.size();
-		auto it = std::find_if(clients.cbegin(),clients.cend(),[&newClient](const auto& wp) { return wp.lock() == newClient; });
-		if (it != clients.cend())
+		const usize oldNumClients = numClients();
+		auto it = std::find_if(clientsBegin(),clientsEnd(),[&newClient](const auto& wp) { return wp.lock() == newClient; });
+		if (it != clientsEnd())
 			return oldNumClients;
 
-		clients.push_back(newClient);
+		activeClients()->push_back(newClient);
 		return oldNumClients;
-	}
-	usize delClient(const std::weak_ptr<Subscriber>& oldClient) override
+	}	
+	usize delClient(const WeakSubPtr& oldClient) override
 	{
-		const usize oldNumClients = clients.size();
+		const usize oldNumClients = numClients();
 		//Remove matching weak_ptrs using the erase-remove idiom
-		clients.erase(std::remove_if(clients.begin(),clients.end(),[&oldClient](const auto& wp) { return IsWeakPtrEqual(wp,oldClient); }),clients.end());
+		activeClients()->erase(std::remove_if(clientsBegin(),clientsEnd(),[&oldClient](const auto& wp) { return IsWeakPtrEqual(wp,oldClient); }),clientsEnd());
 		return oldNumClients;
 	}
 protected:
-	virtual usize sendToClients(const void* dataBuf, usize numBytes)
+	auto inactiveClients()
 	{
-		const usize oldNumClients = clients.size();
-		if (oldNumClients > 0)
+		if (clientsPtr == &oneClients)
+			return &twoClients;
+		else if (clientsPtr == &twoClients)
+			return &oneClients;
+		else
+			return static_cast<WeakSubsVector*>(nullptr);
+	}
+
+	virtual usize sendToClients(DistributedPacket::SharedPtr thePacket)
+	{
+		if (lastSent)
 		{
-			//Remove expired weak_ptrs using the erase-remove idiom
-			clients.erase(std::remove_if(clients.begin(),clients.end(),[](const auto& wp) { return wp.expired(); }),clients.end());
+			assert(!lastSent->nextPacket);
+			lastSent->nextPacket = thePacket;
 		}
 
-		if (numBytes)
-		{
-			for (auto& wp : clients)
-			{
-				auto sp = wp.lock();
-				if (!sp)
-					continue;
+		const usize oldNumClients = numClients();
+		auto& act = *activeClients();
+		auto& inact = *inactiveClients();
 
-				sp->sendResponse(dataBuf,numBytes);
-			}
+		inact.clear();
+		inact.reserve(act.size());
+		for (auto& wp : act)
+		{
+			auto sp = wp.lock();
+			if (!sp)
+				continue;
+
+			inact.emplace_back(sp);
+			sp->sendResponse(thePacket);
 		}
+
+		clientsPtr = &inact;
+		lastSent = std::move(thePacket);
+
 		return oldNumClients;
 	}
 
-	std::vector<std::weak_ptr<Subscriber>> clients;
+private:
+	using WeakSubsVector = std::vector<std::weak_ptr<Subscriber>>;
+	WeakSubsVector oneClients;
+	WeakSubsVector* clientsPtr = &oneClients;
+	WeakSubsVector twoClients;	
+	WeakSubsVector* clientsAlt = &twoClients;
+	DistributedPacket::SharedPtr lastSent;
 };
 
 class UdpListener : public ListenerBase, public std::enable_shared_from_this<UdpListener>
@@ -119,7 +187,7 @@ public:
 	{
 		udpSocket.async_receive_from(
 			boost::asio::buffer(localRecvBuf),currSource,
-			boost::bind(&UdpListener::handleReceive,this,
+			boost::bind(&UdpListener::handleReceive,shared_from_this(),
 				boost::asio::placeholders::error,
 				boost::asio::placeholders::bytes_transferred));
 	}
@@ -132,20 +200,20 @@ public:
 		udpSocket.close();
 		return true;
 	}
-	usize addClient(const std::shared_ptr<Subscriber>& newClient) override
+	usize addClient(const SharedSubPtr& newClient) override
 	{
 		const usize oldNumClients = ListenerBase::addClient(newClient);
-		const usize newNumClients = clients.size();
+		const usize newNumClients = numClients();
 
 		if (newNumClients != oldNumClients)
-			std::cout << "UDP listener " << bindAddr << " number of clients " << oldNumClients << " -> " << clients.size() << std::endl;
+			std::cout << "UDP listener " << bindAddr << " number of clients " << oldNumClients << " -> " << numClients() << std::endl;
 
 		return oldNumClients;
 	}
-	usize delClient(const std::weak_ptr<Subscriber>& oldClient) override
+	usize delClient(const WeakSubPtr& oldClient) override
 	{
 		const usize oldNumClients = ListenerBase::delClient(oldClient);
-		const usize newNumClients = clients.size();
+		const usize newNumClients = numClients();
 
 		if (newNumClients != oldNumClients)
 			std::cout << "UDP listener " << bindAddr << " number of clients " << oldNumClients << " -> " << newNumClients << std::endl;
@@ -164,16 +232,28 @@ private:
 		{
 			std::cout << "Error " << error.message() << " receiving packet on bound addr [" << bindAddr << "] (bytes transferred " << numBytes << ")" << std::endl;
 		}
-
-		const usize oldNumClients = ListenerBase::sendToClients(localRecvBuf.data(),numBytes);
-		const usize newNumClients = clients.size();
-		if (newNumClients != oldNumClients)
+		else 
 		{
-			std::cout << "UDP listener " << bindAddr << " number of clients " << oldNumClients << " -> " << newNumClients << std::endl;
-		}
+			if (numBytes < 1)
+			{
+				std::cout << "Received 0 byte packet from " << currSource << " to " << bindAddr << "!" << std::endl;
+			}
 
-		if (!error)
+			DistributedPacket::SharedPtr thePacket;
+			{
+				std::ostringstream strBuf; strBuf << currSource;
+				thePacket = std::make_shared<DistributedPacket>(strBuf.str(),localRecvBuf.data(),numBytes);
+			}			
+
+			const usize oldNumClients = ListenerBase::sendToClients(std::move(thePacket));
+			const usize newNumClients = numClients();
+			if (newNumClients != oldNumClients)
+			{
+				std::cout << "UDP listener " << bindAddr << " number of clients " << oldNumClients << " -> " << newNumClients << std::endl;
+			}
+
 			initiateReceive();
+		}
 	}
 
 	udp::socket udpSocket;
@@ -185,11 +265,11 @@ private:
 #if defined(BOOST_ASIO_HAS_POSIX_STREAM_DESCRIPTOR)
 class PosixListener : public ListenerBase, public std::enable_shared_from_this<PosixListener>
 {
-	static constexpr usize RECEIVE_BUFFER_SIZE = 65536;
 public:
-	PosixListener(IoContext& ioCtx, int fileNo) : pipeStream(ioCtx), theFileNo(fileNo)
-	{ 
+	PosixListener(IoContext& ioCtx, int fileNo, usize recvBufSize) : pipeStream(ioCtx), theFileNo(fileNo)
+	{
 		pipeStream.assign(fileNo);
+		localRecvBuf.resize(recvBufSize);
 		std::cout << "Pipe listener created for " << fileNo << std::endl;
 	}
 	~PosixListener() 
@@ -209,7 +289,7 @@ public:
 	{
 		boost::asio::async_read(pipeStream,
 			boost::asio::buffer(localRecvBuf),
-			boost::bind(&PosixListener::handleReceive,this,
+			boost::bind(&PosixListener::handleReceive,shared_from_this(),
 				boost::asio::placeholders::error,
 				boost::asio::placeholders::bytes_transferred));
 	}
@@ -222,20 +302,20 @@ public:
 		pipeStream.release();
 		return true;
 	}
-	usize addClient(const std::shared_ptr<Subscriber>& newClient) override
+	usize addClient(const SharedSubPtr& newClient) override
 	{
 		const usize oldNumClients = ListenerBase::addClient(newClient);
-		const usize newNumClients = clients.size();
+		const usize newNumClients = numClients();
 
 		if (newNumClients != oldNumClients)
-			std::cout << "Pipe listener for " << theFileNo << " number of clients " << oldNumClients << " -> " << clients.size() << std::endl;
+			std::cout << "Pipe listener for " << theFileNo << " number of clients " << oldNumClients << " -> " << newNumClients << std::endl;
 
 		return oldNumClients;
 	}
-	usize delClient(const std::weak_ptr<Subscriber>& oldClient) override
+	usize delClient(const WeakSubPtr& oldClient) override
 	{
 		const usize oldNumClients = ListenerBase::delClient(oldClient);
-		const usize newNumClients = clients.size();
+		const usize newNumClients = numClients();
 
 		if (newNumClients != oldNumClients)
 			std::cout << "Pipe listener for " << theFileNo << " number of clients " << oldNumClients << " -> " << newNumClients << std::endl;
@@ -254,21 +334,28 @@ private:
 		{
 			std::cout << "Error " << error.message() << " receiving packet on fileNo " << theFileNo << " (bytes transferred " << numBytes << ")" << std::endl;
 		}
-
-		const usize oldNumClients = ListenerBase::sendToClients(localRecvBuf.data(),numBytes);
-		const usize newNumClients = clients.size();
-		if (newNumClients != oldNumClients)
+		else
 		{
-			std::cout << "Pipe listener for " << theFileNo << " number of clients " << oldNumClients << " -> " << newNumClients << std::endl;
-		}
+			if (numBytes < 1)
+			{
+				std::cout << "Received 0 byte packet from pipe!" << std::endl;
+			}
 
-		if (!error)
+			auto thePacket = std::make_shared<DistributedPacket>("-",localRecvBuf.data(),numBytes);
+			const usize oldNumClients = ListenerBase::sendToClients(std::move(thePacket));
+			const usize newNumClients = numClients();
+			if (newNumClients != oldNumClients)
+			{
+				std::cout << "Pipe listener for " << theFileNo << " number of clients " << oldNumClients << " -> " << newNumClients << std::endl;
+			}
+
 			initiateReceive();
+		}
 	}
 
 	int theFileNo = 0;
 	boost::asio::posix::stream_descriptor pipeStream;
-	std::array<uint8_t,RECEIVE_BUFFER_SIZE> localRecvBuf;
+	ByteVector localRecvBuf;
 };
 static std::shared_ptr<PosixListener> g_pipeListener;
 #endif
@@ -304,9 +391,9 @@ static string IpPortToString(const UdpEndpoint& theEndpoint)
 	string outStr;
 	if (theEndpoint != UdpEndpoint{})
 	{
-		char tempBuf[256];
-		sprintf(tempBuf,"%s:%d",theEndpoint.address().to_string().c_str(),static_cast<int>(theEndpoint.port()));
-		outStr = tempBuf;
+		char tempBuf[16];
+		sprintf(tempBuf,":%d",static_cast<int>(theEndpoint.port()));
+		outStr = theEndpoint.address().to_string() + tempBuf;
 	}
 	return outStr;
 }
@@ -348,6 +435,7 @@ public:
 		if (udpIt != listeners.end())
 			retListener = udpIt->second.lock();
 
+		//create a new listener and put it in the map
 		if (!retListener)
 		{
 			try
@@ -359,14 +447,15 @@ public:
 				std::cout << string("Error ") + e.what() + " creating UDP listener [" << udpEndpoint << "]: " << e.code().message() << std::endl;
 				throw e; //it will be converted into internal server error
 			}
+
+			if (udpIt == listeners.end())
+				listeners.emplace(std::move(parsedEndpoint),retListener);
+			else
+				udpIt->second = retListener;
+
+			retListener->initiateReceive();
 		}
 
-		if (udpIt == listeners.end())
-			listeners.emplace(std::move(parsedEndpoint),retListener);
-		else
-			udpIt->second = retListener;
-
-		retListener->initiateReceive();
 		return retListener;
 	}
 private:
@@ -391,9 +480,15 @@ struct HttpRequest
 class HttpClient : public Subscriber, public std::enable_shared_from_this<HttpClient>
 {
 	static constexpr usize LINE_BUFFER_SIZE = 1024;
-	static constexpr usize SEND_BUFFER_SIZE = 4096;
 public:
-	HttpClient(HttpServer& theServer, tcp::socket&& acceptedSock) : parentServer(theServer), clientSocket(std::move(acceptedSock)) { remoteEndpoint = clientSocket.remote_endpoint(); }
+	HttpClient(HttpServer& theServer, tcp::socket&& acceptedSock) : parentServer(theServer), clientSocket(std::move(acceptedSock)) 
+	{ 
+		remoteEndpoint = clientSocket.remote_endpoint(); 
+		
+		//Option to enable TCP_NODELAY
+		boost::asio::ip::tcp::no_delay option(true);
+		clientSocket.set_option(option);
+	}
 	~HttpClient() 
 	{ 
 		try
@@ -432,17 +527,13 @@ public:
 		return true;
 	}
 
-	void sendResponse(const void* dataBuf, usize dataLen)
+	void sendResponse(DistributedPacket::SharedPtr thePacket)
 	{
-		if (dataLen < 1)
+		if (thePacket->contents.size() < 1)
 			return;
 
-		const usize oldSize = queuedData.size();
-		const usize newSize = oldSize + dataLen;
-		queuedData.resize(newSize);
-		memcpy(&queuedData[oldSize],dataBuf,dataLen);
-		if (!sendingData)
-			initiateSend();
+		if (!currentlySending)
+			initiateSend(std::move(thePacket));
 	}
 
 protected:
@@ -501,7 +592,7 @@ protected:
 		headers += "\r\n";
 		headers += req.responseText;
 
-		sendResponse(headers.c_str(),headers.length());
+		sendResponse(std::make_shared<DistributedPacket>("HTTP",headers.c_str(),headers.length()));
 		if (allOk && myListener)
 			myListener->addClient(shared_from_this());
 
@@ -565,7 +656,7 @@ private:
 				*colonPtr = 0;
 				string headerLeft = line;
 				string headerRight = &colonPtr[1];
-				std::cout << remoteEndpoint << " sent header " << headerLeft << ":" << headerRight << std::endl;
+				//std::cout << remoteEndpoint << " sent header " << headerLeft << ":" << headerRight << std::endl;
 				tempRequest.headers[std::move(headerLeft)] = std::move(headerRight);
 			}
 		}
@@ -625,31 +716,13 @@ private:
 			initiateReceive();
 	}
 
-	bool initiateSend()
+	void initiateSend(DistributedPacket::SharedPtr thePacket)
 	{
-		if (sendingData || queuedData.size() < 1)
-			return false;
+		//std::cout << "Sending " << thePacket->contents.size() << "B " << thePacket->creationTime << " packet from " << thePacket->recvSource << " to " << remoteEndpoint << std::endl;
 
-		usize bytesToSend = 0;
-		if (queuedData.size() > localSendBuf.size())
-		{
-			bytesToSend = localSendBuf.size();
-			memcpy(localSendBuf.data(),queuedData.data(),bytesToSend);
-			const usize remainingDataLen = queuedData.size()-bytesToSend;
-			memmove(queuedData.data(),&queuedData[bytesToSend],remainingDataLen);
-			queuedData.resize(remainingDataLen);
-		}
-		else
-		{
-			bytesToSend = queuedData.size();
-			memcpy(localSendBuf.data(),queuedData.data(),bytesToSend);
-			queuedData.resize(0);
-		}
-
-		sendingData = true;
-		clientSocket.async_send(boost::asio::buffer(localSendBuf.data(),bytesToSend),
+		currentlySending = std::move(thePacket);
+		clientSocket.async_send(boost::asio::buffer(currentlySending->contents),
 			boost::bind(&HttpClient::handleSend,shared_from_this(),boost::asio::placeholders::error,boost::asio::placeholders::bytes_transferred));
-		return true;
 	}
 
 	void handleSend(const ErrorCode& error, usize bytesWritten)
@@ -657,21 +730,20 @@ private:
 		if (error)
 			std::cout << "Error " << error.message() << " sending data to http client " << remoteEndpoint << "(bytes transferred " << bytesWritten << ")" << std::endl;
 
-		sendingData = false;
-		if (queuedData.size() > 0)
-			initiateSend();
+		if (!error && currentlySending && currentlySending->nextPacket)
+			initiateSend(currentlySending->nextPacket);
+		else
+			currentlySending.reset();
 	}
 private:
 	HttpServer& parentServer;
 	tcp::socket clientSocket;
 	TcpEndpoint remoteEndpoint;
 	usize recvBufBytes = 0;
-	std::shared_ptr<ListenerBase> myListener;
-	bool sendingData = false;
-	ByteVector queuedData;
 	HttpRequest tempRequest;
+	std::shared_ptr<ListenerBase> myListener;	
 	std::array<char,LINE_BUFFER_SIZE> localRecvBuf;
-	std::array<uint8_t,SEND_BUFFER_SIZE> localSendBuf;
+	DistributedPacket::SharedPtr currentlySending;
 };
 
 
@@ -705,6 +777,7 @@ int main(int argc, char* argv[])
 	ushort httpPort = 6033;
 	string httpAddress = "0.0.0.0";	
 	string httpFolder = "udp";
+	unsigned pipeRecvBufSize = 1316;
 
 	TcpEndpoint httpListenEndpoint;
 	try 
@@ -712,6 +785,7 @@ int main(int argc, char* argv[])
 		po::options_description desc("Allowed options");
 		desc.add_options()
 			("help,h", "produce help message")
+			("bufsize,b", po::value<unsigned>(&pipeRecvBufSize)->default_value(1316), "Size of stdin receive buffer size in bytes")
 			("address,a", po::value<std::string>(&httpAddress)->default_value("0.0.0.0"), "IP address to bind HTTP server on")
 			("port,p", po::value<unsigned short>(&httpPort)->default_value(6033), "Port to listen for HTTP requests on")
 			("folder,f", po::value<std::string>(&httpFolder)->default_value("udp"), "HTTP requests must start with this folder");
@@ -740,7 +814,7 @@ int main(int argc, char* argv[])
 
 	IoContext ioCtx;
 #if defined(BOOST_ASIO_HAS_POSIX_STREAM_DESCRIPTOR)
-	g_pipeListener = std::make_shared<PosixListener>(ioCtx,STDIN_FILENO);
+	g_pipeListener = std::make_shared<PosixListener>(ioCtx,STDIN_FILENO,pipeRecvBufSize);
 	g_pipeListener->initiateReceive();
 #endif
 	HttpServer server(ioCtx,httpListenEndpoint,httpFolder);
