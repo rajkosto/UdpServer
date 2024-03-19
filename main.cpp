@@ -746,5 +746,8 @@ int main(int argc, char* argv[])
 	HttpServer server(ioCtx,httpListenEndpoint,httpFolder);
 	ioCtx.run();
 
+#if defined(BOOST_ASIO_HAS_POSIX_STREAM_DESCRIPTOR)
+	g_pipeListener.reset();
+#endif
 	return 0;
 }
