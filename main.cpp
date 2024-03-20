@@ -8,6 +8,8 @@
 #include <boost/bind/bind.hpp>
 #include <boost/asio.hpp>
 
+static const char PROGRAM_VERSION[] = "UdpServer 0.2";
+
 using u8 = std::uint8_t;
 using u16 = std::uint16_t;
 using u32 = std::uint32_t;
@@ -270,7 +272,7 @@ public:
 	{
 		pipeStream.assign(fileNo);
 		localRecvBuf.resize(recvBufSize);
-		std::cout << "Pipe listener created for " << fileNo << std::endl;
+		std::cout << "Pipe listener created for " << fileNo << " with buffer size " << localRecvBuf.size() << std::endl;
 	}
 	~PosixListener() 
 	{ 
@@ -420,7 +422,7 @@ public:
 		const char* actualPath = &requestPath[1+pathPrefix.length()+1];
 		std::cout << requestor << " actual PATH: |" << actualPath << "|" << std::endl;
 #if defined(BOOST_ASIO_HAS_POSIX_STREAM_DESCRIPTOR)
-		if (!strcmp(actualPath,"-"))
+		if (!strcmp(actualPath,"-") && g_pipeListener)
 			return g_pipeListener;
 #endif
 
@@ -572,9 +574,9 @@ protected:
 		char tempBuf[256];
 		sprintf(tempBuf,
 			"HTTP/1.1 %d %s\r\n"
-			"Server: UdpServer 0.1\r\n"
+			"Server: %s\r\n"
 			"Connection: close\r\n",
-			req.responseCode,req.responseString);
+			req.responseCode,req.responseString,PROGRAM_VERSION);
 
 		headers = tempBuf;
 		if (req.responseText.length())
@@ -777,7 +779,7 @@ int main(int argc, char* argv[])
 	ushort httpPort = 6033;
 	string httpAddress = "0.0.0.0";	
 	string httpFolder = "udp";
-	unsigned pipeRecvBufSize = 1316;
+	int pipeRecvBufSize = 1316;
 
 	TcpEndpoint httpListenEndpoint;
 	try 
@@ -785,10 +787,10 @@ int main(int argc, char* argv[])
 		po::options_description desc("Allowed options");
 		desc.add_options()
 			("help,h", "produce help message")
-			("bufsize,b", po::value<unsigned>(&pipeRecvBufSize)->default_value(1316), "Size of stdin receive buffer size in bytes")
-			("address,a", po::value<std::string>(&httpAddress)->default_value("0.0.0.0"), "IP address to bind HTTP server on")
-			("port,p", po::value<unsigned short>(&httpPort)->default_value(6033), "Port to listen for HTTP requests on")
-			("folder,f", po::value<std::string>(&httpFolder)->default_value("udp"), "HTTP requests must start with this folder");
+			("bufsize,b", po::value<int>(&pipeRecvBufSize)->default_value(pipeRecvBufSize), "Size of stdin receive buffer size in bytes")
+			("address,a", po::value<std::string>(&httpAddress)->default_value(httpAddress), "IP address to bind HTTP server on")
+			("port,p", po::value<unsigned short>(&httpPort)->default_value(httpPort), "Port to listen for HTTP requests on")
+			("folder,f", po::value<std::string>(&httpFolder)->default_value(httpFolder), "HTTP requests must start with this folder");
 
 		po::variables_map vm;
 		po::store(po::parse_command_line(argc,argv,desc), vm);
@@ -808,14 +810,14 @@ int main(int argc, char* argv[])
 		return 1;
 	}
 
-	std::cout << "Using IP address: " << httpAddress << std::endl;
-	std::cout << "Listening on port: " << httpPort << std::endl;
-	std::cout << "Folder name: " << httpFolder << std::endl;
-
 	IoContext ioCtx;
+	std::cout << "Starting " << PROGRAM_VERSION << " HTTP server on " << httpListenEndpoint << " with folder name " << httpFolder << std::endl;
 #if defined(BOOST_ASIO_HAS_POSIX_STREAM_DESCRIPTOR)
-	g_pipeListener = std::make_shared<PosixListener>(ioCtx,STDIN_FILENO,pipeRecvBufSize);
-	g_pipeListener->initiateReceive();
+	if (pipeRecvBufSize > 0)
+	{
+		g_pipeListener = std::make_shared<PosixListener>(ioCtx,STDIN_FILENO,pipeRecvBufSize);
+		g_pipeListener->initiateReceive();
+	}	
 #endif
 	HttpServer server(ioCtx,httpListenEndpoint,httpFolder);
 	ioCtx.run();
