@@ -8,7 +8,7 @@
 #include <boost/bind/bind.hpp>
 #include <boost/asio.hpp>
 
-static const char PROGRAM_VERSION[] = "UdpServer 0.2";
+static const char PROGRAM_VERSION[] = "UdpServer 0.3";
 
 using u8 = std::uint8_t;
 using u16 = std::uint16_t;
@@ -220,6 +220,9 @@ public:
 		if (newNumClients != oldNumClients)
 			std::cout << "UDP listener " << bindAddr << " number of clients " << oldNumClients << " -> " << newNumClients << std::endl;
 
+		if (newNumClients < 1)
+			stop();
+
 		return oldNumClients;
 	}
 private:
@@ -254,7 +257,8 @@ private:
 				std::cout << "UDP listener " << bindAddr << " number of clients " << oldNumClients << " -> " << newNumClients << std::endl;
 			}
 
-			initiateReceive();
+			if (newNumClients > 0)
+				initiateReceive();
 		}
 	}
 
