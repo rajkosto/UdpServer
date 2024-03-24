@@ -5,16 +5,18 @@
 #include <chrono>
 #include <cassert>
 #include <sstream>
+#include <iomanip>
 #include <boost/bind/bind.hpp>
 #include <boost/asio.hpp>
 
-static const char PROGRAM_VERSION[] = "UdpServer 0.3";
+static const char PROGRAM_VERSION[] = "UdpServer 0.4";
 
 using u8 = std::uint8_t;
 using u16 = std::uint16_t;
 using u32 = std::uint32_t;
 using u64 = std::uint64_t;
 using usize = std::size_t;
+using uchar = unsigned char;
 using ushort = unsigned short;
 using std::string;
 
@@ -40,29 +42,56 @@ static u64 MonotonicMicrosecondNow()
 	return static_cast<u64>(now_us.count());
 }
 
-struct DistributedPacket
+static string currentDateTime() 
 {
-	using SharedPtr = std::shared_ptr<DistributedPacket>;
-	DistributedPacket(string src, const void* srcBytes, usize srcLen) : creationTime(MonotonicMicrosecondNow()), recvSource(std::move(src))
+	//Get current time point
+	auto now = std::chrono::system_clock::now();
+	//Convert to a time_t object
+	auto now_c = std::chrono::system_clock::to_time_t(now);
+	//Convert to tm struct for formatting
+	std::tm now_tm = *std::localtime(&now_c);
+
+	//Use stringstream for formatting
+	std::ostringstream oss;
+	oss << std::put_time(&now_tm, "%y/%m/%d %H:%M:%S");
+	return oss.str();
+}
+
+static std::ostream& logLine()
+{
+	return std::cout << '[' << currentDateTime() << ']';
+}
+
+static constexpr usize FIXED_PACKET_SIZE = 2048;
+struct FixedPacket
+{
+	FixedPacket() : ts(0), len(0) { src[0] = 0; }
+	FixedPacket(const string& theSrc, const void* srcBytes, usize srcLen) : ts(MonotonicMicrosecondNow()), len(static_cast<ushort>(srcLen))
 	{
-		if (srcLen > 0)
-		{
-			contents.resize(srcLen);
-			memcpy(contents.data(),srcBytes,contents.size());
-		}
+		if (theSrc.length() >= sizeof(src))
+			throw std::out_of_range("Packet source too long");
+		if (srcLen > sizeof(data))
+			throw std::out_of_range("Packet data too long");
+
+		strncpy(src,theSrc.c_str(),sizeof(src));
+		memcpy(data,srcBytes,srcLen);
+		if (sizeof(data) > len)
+			memset(&data[len],0,sizeof(data)-len);
 	}
 
-	u64 creationTime;
-	string recvSource;
-	ByteVector contents;
-	SharedPtr nextPacket;
+	u64 ts;
+	ushort len;
+	char src[32];
+	uchar data[FIXED_PACKET_SIZE-sizeof(ts)-sizeof(len)-sizeof(src)];
 };
+static_assert(sizeof(FixedPacket) == FIXED_PACKET_SIZE,"FixedPacket wrong size");
+using FixedPacketsList = std::vector<std::unique_ptr<FixedPacket>>;
 
 class Subscriber
 {
 public:
 	virtual ~Subscriber() {}
-	virtual void sendResponse(DistributedPacket::SharedPtr thePacket) = 0;
+	virtual void sendResponse(const FixedPacket& thePacket) = 0;
 };
 
 class Publisher
@@ -124,14 +153,8 @@ protected:
 			return static_cast<WeakSubsVector*>(nullptr);
 	}
 
-	virtual usize sendToClients(DistributedPacket::SharedPtr thePacket)
+	virtual usize sendToClients(const FixedPacket& thePacket)
 	{
-		if (lastSent)
-		{
-			assert(!lastSent->nextPacket);
-			lastSent->nextPacket = thePacket;
-		}
-
 		const usize oldNumClients = numClients();
 		auto& act = *activeClients();
 		auto& inact = *inactiveClients();
@@ -149,8 +172,6 @@ protected:
 		}
 
 		clientsPtr = &inact;
-		lastSent = std::move(thePacket);
-
 		return oldNumClients;
 	}
 
@@ -160,28 +181,26 @@ private:
 	WeakSubsVector* clientsPtr = &oneClients;
 	WeakSubsVector twoClients;	
 	WeakSubsVector* clientsAlt = &twoClients;
-	DistributedPacket::SharedPtr lastSent;
 };
 
 class UdpListener : public ListenerBase, public std::enable_shared_from_this<UdpListener>
 {
-	static constexpr usize RECEIVE_BUFFER_SIZE = 2048;
 public:
 	UdpListener(IoContext& ioCtx, UdpEndpoint listenAddr) : udpSocket(ioCtx,listenAddr)
 	{ 
 		bindAddr = udpSocket.local_endpoint();
-		std::cout << "UDP listener " << bindAddr << " created" << std::endl;
+		logLine() << "UDP listener " << bindAddr << " created" << std::endl;
 	}
 	~UdpListener() 
 	{ 
 		try
 		{
 			stop(); 
-			std::cout << "UDP listener " << bindAddr << " destroyed" << std::endl; 
+			logLine() << "UDP listener " << bindAddr << " destroyed" << std::endl; 
 		}
 		catch (const SystemError& e)
 		{
-			std::cout << string("Error ") + e.what() + " destroying UDP listener [" << bindAddr << "]: " << e.code().message() << std::endl; 
+			logLine() << string("Error ") + e.what() + " destroying UDP listener [" << bindAddr << "]: " << e.code().message() << std::endl; 
 		}
 	}
 
@@ -208,7 +227,7 @@ public:
 		const usize newNumClients = numClients();
 
 		if (newNumClients != oldNumClients)
-			std::cout << "UDP listener " << bindAddr << " number of clients " << oldNumClients << " -> " << numClients() << std::endl;
+			logLine() << "UDP listener " << bindAddr << " number of clients " << oldNumClients << " -> " << numClients() << std::endl;
 
 		return oldNumClients;
 	}
@@ -218,7 +237,7 @@ public:
 		const usize newNumClients = numClients();
 
 		if (newNumClients != oldNumClients)
-			std::cout << "UDP listener " << bindAddr << " number of clients " << oldNumClients << " -> " << newNumClients << std::endl;
+			logLine() << "UDP listener " << bindAddr << " number of clients " << oldNumClients << " -> " << newNumClients << std::endl;
 
 		if (newNumClients < 1)
 			stop();
@@ -230,31 +249,31 @@ private:
 	{
 		if (error == boost::asio::error::operation_aborted)
 		{
-			std::cout << "Source connection from " << currSource << " to " << bindAddr << " closed due to no longer being needed." << std::endl;
+			logLine() << "Source connection from " << currSource << " to " << bindAddr << " closed due to no longer being needed." << std::endl;
 			return;
 		}
 		else if (error)
 		{
-			std::cout << "Error " << error.message() << " receiving packet on bound addr [" << bindAddr << "] (bytes transferred " << numBytes << ")" << std::endl;
+			logLine() << "Error " << error.message() << " receiving packet on bound addr [" << bindAddr << "] (bytes transferred " << numBytes << ")" << std::endl;
 		}
 		else 
 		{
 			if (numBytes < 1)
 			{
-				std::cout << "Received 0 byte packet from " << currSource << " to " << bindAddr << "!" << std::endl;
+				logLine() << "Received 0 byte packet from " << currSource << " to " << bindAddr << "!" << std::endl;
 			}
 
-			DistributedPacket::SharedPtr thePacket;
+			FixedPacket thePacket;
 			{
 				std::ostringstream strBuf; strBuf << currSource;
-				thePacket = std::make_shared<DistributedPacket>(strBuf.str(),localRecvBuf.data(),numBytes);
-			}			
+				thePacket = {strBuf.str(),localRecvBuf.data(),numBytes};
+			}
 
-			const usize oldNumClients = ListenerBase::sendToClients(std::move(thePacket));
+			const usize oldNumClients = ListenerBase::sendToClients(thePacket);
 			const usize newNumClients = numClients();
 			if (newNumClients != oldNumClients)
 			{
-				std::cout << "UDP listener " << bindAddr << " number of clients " << oldNumClients << " -> " << newNumClients << std::endl;
+				logLine() << "UDP listener " << bindAddr << " number of clients " << oldNumClients << " -> " << newNumClients << std::endl;
 			}
 
 			if (newNumClients > 0)
@@ -265,7 +284,7 @@ private:
 	udp::socket udpSocket;
 	UdpEndpoint bindAddr;
 	UdpEndpoint currSource;
-	std::array<uint8_t,RECEIVE_BUFFER_SIZE> localRecvBuf;
+	std::array<uint8_t,sizeof(FixedPacket::data)> localRecvBuf;
 };
 
 #if defined(BOOST_ASIO_HAS_POSIX_STREAM_DESCRIPTOR)
@@ -276,18 +295,18 @@ public:
 	{
 		pipeStream.assign(fileNo);
 		localRecvBuf.resize(recvBufSize);
-		std::cout << "Pipe listener created for " << fileNo << " with buffer size " << localRecvBuf.size() << std::endl;
+		logLine() << "Pipe listener created for " << fileNo << " with buffer size " << localRecvBuf.size() << std::endl;
 	}
 	~PosixListener() 
 	{ 
 		try
 		{
 			stop(); 
-			std::cout << "Pipe listener for " << theFileNo << " destroyed" << std::endl; 
+			logLine() << "Pipe listener for " << theFileNo << " destroyed" << std::endl; 
 		}
 		catch (const SystemError& e)
 		{
-			std::cout << string("Error ") + e.what() + " destroying Pipe listener for " << theFileNo << ": " << e.code().message() << std::endl; 
+			logLine() << string("Error ") + e.what() + " destroying Pipe listener for " << theFileNo << ": " << e.code().message() << std::endl; 
 		}
 	}
 
@@ -314,7 +333,7 @@ public:
 		const usize newNumClients = numClients();
 
 		if (newNumClients != oldNumClients)
-			std::cout << "Pipe listener for " << theFileNo << " number of clients " << oldNumClients << " -> " << newNumClients << std::endl;
+			logLine() << "Pipe listener for " << theFileNo << " number of clients " << oldNumClients << " -> " << newNumClients << std::endl;
 
 		return oldNumClients;
 	}
@@ -324,7 +343,7 @@ public:
 		const usize newNumClients = numClients();
 
 		if (newNumClients != oldNumClients)
-			std::cout << "Pipe listener for " << theFileNo << " number of clients " << oldNumClients << " -> " << newNumClients << std::endl;
+			logLine() << "Pipe listener for " << theFileNo << " number of clients " << oldNumClients << " -> " << newNumClients << std::endl;
 
 		return oldNumClients;
 	}
@@ -333,26 +352,26 @@ private:
 	{
 		if (error == boost::asio::error::operation_aborted)
 		{
-			std::cout << "Pipe for " << theFileNo << " closed due to no longer being needed." << std::endl;
+			logLine() << "Pipe for " << theFileNo << " closed due to no longer being needed." << std::endl;
 			return;
 		}
 		else if (error)
 		{
-			std::cout << "Error " << error.message() << " receiving packet on fileNo " << theFileNo << " (bytes transferred " << numBytes << ")" << std::endl;
+			logLine() << "Error " << error.message() << " receiving packet on fileNo " << theFileNo << " (bytes transferred " << numBytes << ")" << std::endl;
 		}
 		else
 		{
 			if (numBytes < 1)
 			{
-				std::cout << "Received 0 byte packet from pipe!" << std::endl;
+				logLine() << "Received 0 byte packet from pipe!" << std::endl;
 			}
 
-			auto thePacket = std::make_shared<DistributedPacket>("-",localRecvBuf.data(),numBytes);
-			const usize oldNumClients = ListenerBase::sendToClients(std::move(thePacket));
+			FixedPacket thePacket{"-",localRecvBuf.data(),numBytes};
+			const usize oldNumClients = ListenerBase::sendToClients(thePacket);
 			const usize newNumClients = numClients();
 			if (newNumClients != oldNumClients)
 			{
-				std::cout << "Pipe listener for " << theFileNo << " number of clients " << oldNumClients << " -> " << newNumClients << std::endl;
+				logLine() << "Pipe listener for " << theFileNo << " number of clients " << oldNumClients << " -> " << newNumClients << std::endl;
 			}
 
 			initiateReceive();
@@ -424,7 +443,7 @@ public:
 			return retListener;
 
 		const char* actualPath = &requestPath[1+pathPrefix.length()+1];
-		std::cout << requestor << " actual PATH: |" << actualPath << "|" << std::endl;
+		logLine() << requestor << " actual PATH: |" << actualPath << "|" << std::endl;
 #if defined(BOOST_ASIO_HAS_POSIX_STREAM_DESCRIPTOR)
 		if (!strcmp(actualPath,"-") && g_pipeListener)
 			return g_pipeListener;
@@ -435,7 +454,7 @@ public:
 			return retListener;
 
 		string parsedEndpoint = IpPortToString(udpEndpoint);
-		std::cout << requestor << " parsed IpPort: |" << parsedEndpoint << "|" << std::endl;
+		logLine() << requestor << " parsed IpPort: |" << parsedEndpoint << "|" << std::endl;
 
 		auto udpIt = listeners.find(parsedEndpoint);
 		if (udpIt != listeners.end())
@@ -450,7 +469,7 @@ public:
 			}
 			catch (const SystemError& e)
 			{
-				std::cout << string("Error ") + e.what() + " creating UDP listener [" << udpEndpoint << "]: " << e.code().message() << std::endl;
+				logLine() << string("Error ") + e.what() + " creating UDP listener [" << udpEndpoint << "]: " << e.code().message() << std::endl;
 				throw e; //it will be converted into internal server error
 			}
 
@@ -479,6 +498,7 @@ struct HttpRequest
 	string path;
 	std::map<string,string> headers;
 	int responseCode = 0;
+	bool processed = false;
 	const char* responseString = "ERR";
 	string responseText;
 };
@@ -500,11 +520,11 @@ public:
 		try
 		{
 			stop(); 
-			std::cout << "HTTP client " << remoteEndpoint << " destroyed" << std::endl; 
+			logLine() << "HTTP client " << remoteEndpoint << " destroyed" << std::endl; 
 		}
 		catch (const SystemError& e)
 		{
-			std::cout << string("Error ") + e.what() + " destroying HTTP client [" << remoteEndpoint << "]: " << e.code().message() << std::endl; 
+			logLine() << string("Error ") + e.what() + " destroying HTTP client [" << remoteEndpoint << "]: " << e.code().message() << std::endl; 
 		}
 	}
 
@@ -533,13 +553,23 @@ public:
 		return true;
 	}
 
-	void sendResponse(DistributedPacket::SharedPtr thePacket)
+	void sendResponse(const FixedPacket& thePacket)
 	{
-		if (thePacket->contents.size() < 1)
+		if (thePacket.len < 1)
 			return;
 
+		static constexpr usize MAX_SENDQUEUE_BYTES = 10*1024*1024; //10MiB
+		while (sendQueue.size() >= MAX_SENDQUEUE_BYTES/FIXED_PACKET_SIZE)
+		{
+			auto frontPtr = std::move(sendQueue.front());
+			sendQueue.erase(sendQueue.begin());
+
+			logLine() << "Client " << remoteEndpoint << " send buffer larger than " << MAX_SENDQUEUE_BYTES << "B, dropping " << frontPtr->len << "B " << frontPtr->ts << " packet from " << frontPtr->src << std::endl;
+		}
+		sendQueue.emplace_back(std::make_unique<FixedPacket>(thePacket));
+
 		if (!currentlySending)
-			initiateSend(std::move(thePacket));
+			initiateSend();
 	}
 
 protected:
@@ -567,6 +597,7 @@ protected:
 		}
 
 		bool allOk = false;
+		req.processed = true;
 		if (req.responseCode == 0) //still not errored
 		{
 			req.responseCode = 200;
@@ -598,7 +629,7 @@ protected:
 		headers += "\r\n";
 		headers += req.responseText;
 
-		sendResponse(std::make_shared<DistributedPacket>("HTTP",headers.c_str(),headers.length()));
+		sendResponse(FixedPacket{"HTTP",headers.c_str(),headers.length()});
 		if (allOk && myListener)
 			myListener->addClient(shared_from_this());
 
@@ -612,41 +643,47 @@ private:
 		usize lineLen = strlen(line);
 		if (lineLen < 1)
 		{
-			std::cout << remoteEndpoint << " sent empty line!" << std::endl;
+			logLine() << remoteEndpoint << " sent empty line!" << std::endl;
 			return false;
 		}
 		if (line[lineLen-1] != '\r')
 		{
-			std::cout << remoteEndpoint << " sent incomplete line: |" << line << "|" << std::endl;
+			logLine() << remoteEndpoint << " sent incomplete line: |" << line << "|" << std::endl;
 			return false;
 		}
 
 		line[--lineLen] = 0;
-		if (tempRequest.path.size() < 1) //first line must be http path
+		if (currRequest.processed)
+		{
+			logLine() << remoteEndpoint << " already processed but sent line: |" << line << "|" << std::endl;
+			return false;
+		}
+
+		if (currRequest.path.size() < 1) //first line must be http path
 		{
 			if (strncmp(line,"GET ",4))
 			{
 				//invalid request type
-				tempRequest.path = "ERROR";
-				tempRequest.responseCode = 400;
-				tempRequest.responseText = "Only GET method is allowed";
+				currRequest.path = "ERROR";
+				currRequest.responseCode = 400;
+				currRequest.responseText = "Only GET method is allowed";
 			}
 			else
 			{
-				tempRequest.path = &line[4];
-				const auto endPos = tempRequest.path.find_first_of(' ');
-				if (endPos != tempRequest.path.npos)
-					tempRequest.path.resize(endPos);
+				currRequest.path = &line[4];
+				const auto endPos = currRequest.path.find_first_of(' ');
+				if (endPos != currRequest.path.npos)
+					currRequest.path.resize(endPos);
 
-				if (tempRequest.path.length() < 1)
+				if (currRequest.path.length() < 1)
 				{
-					tempRequest.path = "ERROR";
-					tempRequest.responseCode = 400;
-					tempRequest.responseText = "No request path!";
+					currRequest.path = "ERROR";
+					currRequest.responseCode = 400;
+					currRequest.responseText = "No request path!";
 				}
 				else
 				{
-					std::cout << remoteEndpoint << " sent GET |" << tempRequest.path << "|" << std::endl;
+					logLine() << remoteEndpoint << " sent GET |" << currRequest.path << "|" << std::endl;
 				}
 			}
 		}
@@ -655,24 +692,21 @@ private:
 			auto colonPtr = strchr(line,':');
 			if (colonPtr == nullptr)
 			{
-				std::cout << remoteEndpoint << " sent header line without colon: |" << line << "|" << std::endl;
+				logLine() << remoteEndpoint << " sent header line without colon: |" << line << "|" << std::endl;
 			}
 			else
 			{
 				*colonPtr = 0;
 				string headerLeft = line;
 				string headerRight = &colonPtr[1];
-				//std::cout << remoteEndpoint << " sent header " << headerLeft << ":" << headerRight << std::endl;
-				tempRequest.headers[std::move(headerLeft)] = std::move(headerRight);
+				logLine() << remoteEndpoint << " sent header " << headerLeft << ":" << headerRight << std::endl;
+				currRequest.headers[std::move(headerLeft)] = std::move(headerRight);
 			}
 		}
 		else //begin request as empty newline was sent
 		{
-			std::cout << remoteEndpoint << " wants to begin request!" << std::endl;
-			
-			HttpRequest theRequest = std::move(tempRequest);
-			tempRequest = HttpRequest{};
-			return processRequest(theRequest);			
+			logLine() << remoteEndpoint << " wants to begin request!" << std::endl;
+			return processRequest(currRequest);			
 		}
 
 		return true;
@@ -683,11 +717,11 @@ private:
 		if (error)
 		{
 			if (error == boost::asio::error::eof)
-				std::cout << "HTTP client " << remoteEndpoint << " cleanly closed connection." << std::endl;
+				logLine() << "HTTP client " << remoteEndpoint << " cleanly closed connection." << std::endl;
 			else if (error == boost::asio::error::connection_reset)
-				std::cout << "HTTP client " << remoteEndpoint << " connection reset by peer." << std::endl;
+				logLine() << "HTTP client " << remoteEndpoint << " connection reset by peer." << std::endl;
 			else
-				std::cout << "Error " << error.message() << " receiving line from http client " << remoteEndpoint << "(bytes transferred " << numBytes << ")" << std::endl;
+				logLine() << "Error " << error.message() << " receiving line from http client " << remoteEndpoint << "(bytes transferred " << numBytes << ")" << std::endl;
 
 			return;
 		}
@@ -722,34 +756,42 @@ private:
 			initiateReceive();
 	}
 
-	void initiateSend(DistributedPacket::SharedPtr thePacket)
+	void initiateSend()
 	{
-		//std::cout << "Sending " << thePacket->contents.size() << "B " << thePacket->creationTime << " packet from " << thePacket->recvSource << " to " << remoteEndpoint << std::endl;
+		if (sendQueue.size() < 1)
+			throw std::out_of_range("initiateSend called with empty sendQueue");
+		if (currentlySending)
+			throw std::out_of_range("initiateSend called while already sending");
 
-		currentlySending = std::move(thePacket);
-		clientSocket.async_send(boost::asio::buffer(currentlySending->contents),
+		//sendQueue.pop_front() into currentlySending
+		currentlySending = std::move(sendQueue.front());
+		sendQueue.erase(sendQueue.begin());
+
+		//logLine() << "Sending " << currentlySending->len << "B " << currentlySending->ts << " packet from " << currentlySending->src << " to " << remoteEndpoint << std::endl;
+
+		clientSocket.async_send(boost::asio::buffer(currentlySending->data,currentlySending->len),
 			boost::bind(&HttpClient::handleSend,shared_from_this(),boost::asio::placeholders::error,boost::asio::placeholders::bytes_transferred));
 	}
 
 	void handleSend(const ErrorCode& error, usize bytesWritten)
 	{
 		if (error)
-			std::cout << "Error " << error.message() << " sending data to http client " << remoteEndpoint << "(bytes transferred " << bytesWritten << ")" << std::endl;
+			logLine() << "Error " << error.message() << " sending data to http client " << remoteEndpoint << "(bytes transferred " << bytesWritten << ")" << std::endl;
 
-		if (!error && currentlySending && currentlySending->nextPacket)
-			initiateSend(currentlySending->nextPacket);
-		else
-			currentlySending.reset();
+		currentlySending.reset();
+		if (sendQueue.size() > 0)
+			initiateSend();
 	}
 private:
 	HttpServer& parentServer;
 	tcp::socket clientSocket;
 	TcpEndpoint remoteEndpoint;
 	usize recvBufBytes = 0;
-	HttpRequest tempRequest;
+	HttpRequest currRequest;
 	std::shared_ptr<ListenerBase> myListener;	
 	std::array<char,LINE_BUFFER_SIZE> localRecvBuf;
-	DistributedPacket::SharedPtr currentlySending;
+	FixedPacketsList sendQueue;
+	FixedPacketsList::value_type currentlySending;
 };
 
 
@@ -767,7 +809,7 @@ void HttpServer::handleAccept(const ErrorCode& error)
 	}
 	else 
 	{
-		std::cerr << "HTTP server accept error: " << error.message() << std::endl;
+		logLine() << "HTTP server accept error: " << error.message() << std::endl;
 		return;
 	}
 
@@ -815,10 +857,15 @@ int main(int argc, char* argv[])
 	}
 
 	IoContext ioCtx;
-	std::cout << "Starting " << PROGRAM_VERSION << " HTTP server on " << httpListenEndpoint << " with folder name " << httpFolder << std::endl;
+	logLine() << "Starting " << PROGRAM_VERSION << " HTTP server on " << httpListenEndpoint << " with folder name " << httpFolder << std::endl;
 #if defined(BOOST_ASIO_HAS_POSIX_STREAM_DESCRIPTOR)
 	if (pipeRecvBufSize > 0)
 	{
+		if (pipeRecvBufSize > sizeof(FixedPacket::data))
+		{
+			std::cerr << "bufsize cannot be larger than " << sizeof(FixedPacket::data) << "B, clamping to " << sizeof(FixedPacket::data) << "B!" << std::endl;
+			pipeRecvBufSize = sizeof(FixedPacket::data);
+		}
 		g_pipeListener = std::make_shared<PosixListener>(ioCtx,STDIN_FILENO,pipeRecvBufSize);
 		g_pipeListener->initiateReceive();
 	}	
