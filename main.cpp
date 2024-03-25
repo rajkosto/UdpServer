@@ -9,7 +9,7 @@
 #include <boost/bind/bind.hpp>
 #include <boost/asio.hpp>
 
-static const char PROGRAM_VERSION[] = "UdpServer 0.5";
+static const char PROGRAM_VERSION[] = "UdpServer 0.6";
 
 using u8 = std::uint8_t;
 using u16 = std::uint16_t;
@@ -545,7 +545,10 @@ public:
 	bool stop()
 	{
 		if (myListener)
+		{
 			myListener->delClient(weak_from_this());
+			myListener.reset();
+		}
 
 		if (!clientSocket.is_open())
 			return false;
@@ -741,9 +744,13 @@ private:
 		if (error)
 		{
 			if (error == boost::asio::error::eof)
-				logLine() << "HTTP client " << remoteEndpoint << " cleanly closed connection." << std::endl;
+				logLine() << "HTTP client " << remoteEndpoint << " cleanly closed connection during receive." << std::endl;
 			else if (error == boost::asio::error::connection_reset)
-				logLine() << "HTTP client " << remoteEndpoint << " connection reset by peer." << std::endl;
+				logLine() << "HTTP client " << remoteEndpoint << " connection reset by peer during receive." << std::endl;
+			else if (error == boost::asio::error::connection_aborted)
+				logLine() << "HTTP client " << remoteEndpoint << " connection aborted during receive." << std::endl;
+			else if (error == boost::asio::error::operation_aborted)
+				logLine() << "HTTP client " << remoteEndpoint << " operation aborted during receive." << std::endl;
 			else
 				logLine() << "Error " << error.message() << " receiving line from http client " << remoteEndpoint << "(bytes transferred " << numBytes << ")" << std::endl;
 
@@ -800,10 +807,55 @@ private:
 
 	void handleSend(const ErrorCode& error, usize bytesWritten)
 	{
+		bool fatal = false;
+
 		if (error)
-			logLine() << "Error " << error.message() << " sending data to http client " << remoteEndpoint << "(bytes transferred " << bytesWritten << ")" << std::endl;
+		{
+			string packetDescr;
+			{
+				std::ostringstream ostr;
+				const u64 currentTime = MonotonicMicrosecondNow();
+				ostr << "during send of " << currentlySending->ts << " (" << currentlySending->len << "B) sent at " << currentlySending->sendTs << " (" << (currentTime-currentlySending->sendTs) << "us ago) currTime: " << currentTime << " source: " << currentlySending->src;
+				packetDescr = ostr.str();
+			}
+			if (error == boost::asio::error::eof)
+			{
+				logLine() << "HTTP client " << remoteEndpoint << " cleanly closed connection " << packetDescr << std::endl;
+				fatal = true;
+			}
+			else if (error == boost::asio::error::connection_reset)
+			{
+				logLine() << "HTTP client " << remoteEndpoint << " connection reset " << packetDescr << std::endl;
+				fatal = true;
+			}
+			else if (error == boost::asio::error::connection_aborted)
+			{
+				logLine() << "HTTP client " << remoteEndpoint << " connection aborted " << packetDescr << std::endl;
+				fatal = true;
+			}
+			else if (error == boost::asio::error::operation_aborted)
+			{
+				logLine() << "HTTP client " << remoteEndpoint << " operation aborted " << packetDescr << std::endl;
+				fatal = true;
+			}
+			else
+				logLine() << "Error " << error.message() << " sending data to http client " << remoteEndpoint << "(bytes transferred " << bytesWritten << ")" << std::endl;
+		}		
 
 		currentlySending.reset();
+		if (fatal)
+		{
+			sendQueue.clear();
+			try 
+			{ 
+				stop(); 
+			}
+			catch (const SystemError& e)
+			{
+				logLine() << string("Error ") + e.what() + " stopping HTTP client [" << remoteEndpoint << "]: " << e.code().message() << std::endl;
+			}			
+		}
+
 		if (sendQueue.size() > 0)
 			initiateSend();
 	}
