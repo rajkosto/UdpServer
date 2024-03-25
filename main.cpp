@@ -9,7 +9,7 @@
 #include <boost/bind/bind.hpp>
 #include <boost/asio.hpp>
 
-static const char PROGRAM_VERSION[] = "UdpServer 0.4";
+static const char PROGRAM_VERSION[] = "UdpServer 0.5";
 
 using u8 = std::uint8_t;
 using u16 = std::uint16_t;
@@ -65,7 +65,7 @@ static std::ostream& logLine()
 static constexpr usize FIXED_PACKET_SIZE = 2048;
 struct FixedPacket
 {
-	FixedPacket() : ts(0), len(0) { src[0] = 0; }
+	FixedPacket() { src[0] = 0; }
 	FixedPacket(const string& theSrc, const void* srcBytes, usize srcLen) : ts(MonotonicMicrosecondNow()), len(static_cast<ushort>(srcLen))
 	{
 		if (theSrc.length() >= sizeof(src))
@@ -79,10 +79,11 @@ struct FixedPacket
 			memset(&data[len],0,sizeof(data)-len);
 	}
 
-	u64 ts;
-	ushort len;
-	char src[32];
-	uchar data[FIXED_PACKET_SIZE-sizeof(ts)-sizeof(len)-sizeof(src)];
+	u64 ts = 0;
+	u64 sendTs = 0;
+	ushort len = 0;
+	char src[30];
+	uchar data[FIXED_PACKET_SIZE-sizeof(ts)-sizeof(sendTs)-sizeof(len)-sizeof(src)];
 };
 static_assert(sizeof(FixedPacket) == FIXED_PACKET_SIZE,"FixedPacket wrong size");
 using FixedPacketsList = std::vector<std::unique_ptr<FixedPacket>>;
@@ -454,7 +455,7 @@ public:
 			return retListener;
 
 		string parsedEndpoint = IpPortToString(udpEndpoint);
-		logLine() << requestor << " parsed IpPort: |" << parsedEndpoint << "|" << std::endl;
+		//logLine() << requestor << " parsed IpPort: |" << parsedEndpoint << "|" << std::endl;
 
 		auto udpIt = listeners.find(parsedEndpoint);
 		if (udpIt != listeners.end())
@@ -559,12 +560,35 @@ public:
 			return;
 
 		static constexpr usize MAX_SENDQUEUE_BYTES = 10*1024*1024; //10MiB
-		while (sendQueue.size() >= MAX_SENDQUEUE_BYTES/FIXED_PACKET_SIZE)
+		if (sendQueue.size() >= MAX_SENDQUEUE_BYTES/FIXED_PACKET_SIZE)
 		{
-			auto frontPtr = std::move(sendQueue.front());
-			sendQueue.erase(sendQueue.begin());
+			auto startIt = sendQueue.begin();
+			auto middleIt = startIt+(sendQueue.size()/2);
+			const u64 firstTs = (*startIt)->ts;
+			const u64 firstSendTs = (*startIt)->sendTs;
+			const u64 middleTs = (*middleIt)->ts;
+			const u64 middleSendTs = (*middleIt)->sendTs;
+			usize droppedBytes = 0;
+			for (auto it=startIt; it!=middleIt; ++it)
+				droppedBytes += (*it)->len;
 
-			logLine() << "Client " << remoteEndpoint << " send buffer larger than " << MAX_SENDQUEUE_BYTES << "B, dropping " << frontPtr->len << "B " << frontPtr->ts << " packet from " << frontPtr->src << std::endl;
+			const auto currTs = MonotonicMicrosecondNow();
+			bool isSending = false;
+			if (currentlySending)
+				isSending = true;
+
+			u64 lastTs = 0;
+			u64 sendingTs = 0;
+			if (currentlySending)
+			{
+				lastTs = currentlySending->ts;
+				sendingTs = currentlySending->sendTs;
+			}
+
+			sendQueue.erase(startIt,middleIt);
+			logLine() << "Client " << remoteEndpoint << " send buffer TOO LARGE! Dropping half (" << droppedBytes << "B) @ ts: " << currTs 
+				<< " fTs: " << firstTs << " fSTs: " << firstSendTs << " mTs: " << middleTs << " mSTs: " << middleSendTs 
+				<< "isSending: " << isSending << " lTs: " << lastTs << " sTs: " << sendingTs << std::endl;
 		}
 		sendQueue.emplace_back(std::make_unique<FixedPacket>(thePacket));
 
@@ -699,7 +723,7 @@ private:
 				*colonPtr = 0;
 				string headerLeft = line;
 				string headerRight = &colonPtr[1];
-				logLine() << remoteEndpoint << " sent header " << headerLeft << ":" << headerRight << std::endl;
+				//logLine() << remoteEndpoint << " sent header " << headerLeft << ":" << headerRight << std::endl;
 				currRequest.headers[std::move(headerLeft)] = std::move(headerRight);
 			}
 		}
@@ -765,6 +789,7 @@ private:
 
 		//sendQueue.pop_front() into currentlySending
 		currentlySending = std::move(sendQueue.front());
+		currentlySending->sendTs = MonotonicMicrosecondNow();
 		sendQueue.erase(sendQueue.begin());
 
 		//logLine() << "Sending " << currentlySending->len << "B " << currentlySending->ts << " packet from " << currentlySending->src << " to " << remoteEndpoint << std::endl;
