@@ -9,7 +9,7 @@
 #include <boost/bind/bind.hpp>
 #include <boost/asio.hpp>
 
-static const char PROGRAM_VERSION[] = "UdpServer 0.7";
+static const char PROGRAM_VERSION[] = "UdpServer 0.8";
 
 using u8 = std::uint8_t;
 using u16 = std::uint16_t;
@@ -922,6 +922,11 @@ private:
 			else if (error == boost::asio::error::connection_reset)
 			{
 				logLine() << "HTTP client " << remoteEndpoint << " connection reset " << packetDescr << std::endl;
+				fatal = true;
+			}
+			else if (error == boost::asio::error::broken_pipe) 
+			{
+				logLine() << "HTTP client " << remoteEndpoint << " got broken pipe - connection lost " << packetDescr << std::endl;
 				fatal = true;
 			}
 			else if (error == boost::asio::error::connection_aborted)
